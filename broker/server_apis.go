@@ -25,11 +25,12 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/pkg/errors"
+	log "github.com/sirupsen/logrus"
+
 	"github.com/pelicanplatform/pelican/param"
 	"github.com/pelicanplatform/pelican/server_structs"
 	"github.com/pelicanplatform/pelican/token_scopes"
-	"github.com/pkg/errors"
-	log "github.com/sirupsen/logrus"
 )
 
 type (
@@ -144,7 +145,7 @@ func reverseRequest(ctx context.Context, ginCtx *gin.Context) {
 		return
 	}
 
-	ok, err := verifyToken(ctx, token, "/caches/"+hostname, param.Server_ExternalWebUrl.GetString(), token_scopes.Broker_Reverse)
+	ok, err := verifyToken(ctx, token, server_structs.GetCacheNS(hostname), param.Server_ExternalWebUrl.GetString(), token_scopes.Broker_Reverse)
 	if err != nil {
 		log.Errorln("Failed to verify token for cache reversal request:", err)
 		ginCtx.AbortWithStatusJSON(http.StatusBadRequest, newBrokerRespFail("Failed to verify provided token"))

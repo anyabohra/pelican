@@ -19,6 +19,7 @@
 package director
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/netip"
@@ -30,6 +31,7 @@ import (
 	"github.com/jellydator/ttlcache/v3"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/pelicanplatform/pelican/param"
 	"github.com/pelicanplatform/pelican/server_structs"
@@ -46,8 +48,10 @@ const (
 
 var (
 	// The in-memory cache of xrootd server advertisement, with the key being ServerAd.URL.String()
-	serverAds            = ttlcache.New(ttlcache.WithTTL[string, *server_structs.Advertisement](15 * time.Minute))
-	filteredServers      = map[string]filterType{} // The map holds servers that are disabled, with the key being the ServerAd.Name
+	serverAds = ttlcache.New(ttlcache.WithTTL[string, *server_structs.Advertisement](15 * time.Minute))
+	// The map holds servers that are disabled, with the key being the ServerAd.Name
+	// The map should be idenpendent of serverAds as we want to persist this change in-memory, regardless of the presence of the serverAd
+	filteredServers      = map[string]filterType{}
 	filteredServersMutex = sync.RWMutex{}
 )
 
@@ -68,20 +72,27 @@ func (f filterType) String() string {
 	}
 }
 
-func recordAd(ad server_structs.ServerAd, namespaceAds *[]server_structs.NamespaceAdV2) {
-	if err := updateLatLong(&ad); err != nil {
-		log.Debugln("Failed to lookup GeoIP coordinates for host", ad.URL.Host)
+// recordAd does following for an incoming ServerAd and []NamespaceAdV2 pair:
+//
+//  1. Update the ServerAd by setting server location and updating server topology attribute
+//  2. Record the ServerAd and NamespaceAdV2 to the TTL cache
+//  3. Set up the server `stat` call utilities
+//  4. Set up utilities for collecting origin/health server file transfer test status
+//  5. Return the updated ServerAd. The ServerAd passed in will not be modified
+func recordAd(ctx context.Context, sAd server_structs.ServerAd, namespaceAds *[]server_structs.NamespaceAdV2) (updatedAd server_structs.ServerAd) {
+	if err := updateLatLong(&sAd); err != nil {
+		log.Debugln("Failed to lookup GeoIP coordinates for host", sAd.URL.Host)
 	}
 
-	if ad.URL.String() == "" {
-		log.Errorf("The URL of the serverAd %#v is empty. Cannot set the TTL cache.", ad)
+	if sAd.URL.String() == "" {
+		log.Errorf("The URL of the serverAd %#v is empty. Cannot set the TTL cache.", sAd)
 		return
 	}
 	// Since servers from topology always use http, while servers from Pelican always use https
 	// we want to ignore the scheme difference when checking duplicates (only consider hostname:port)
-	rawURL := ad.URL.String() // could be http (topology) or https (Pelican or some topology ones)
-	httpURL := ad.URL.String()
-	httpsURL := ad.URL.String()
+	rawURL := sAd.URL.String() // could be http (topology) or https (Pelican or some topology ones)
+	httpURL := sAd.URL.String()
+	httpsURL := sAd.URL.String()
 	if strings.HasPrefix(rawURL, "https") {
 		httpURL = "http" + strings.TrimPrefix(rawURL, "https")
 	}
@@ -99,24 +110,115 @@ func recordAd(ad server_structs.ServerAd, namespaceAds *[]server_structs.Namespa
 
 	// There's an existing ad in the cache
 	if existing != nil {
-		if ad.FromTopology && !existing.Value().FromTopology {
+		if sAd.FromTopology && !existing.Value().FromTopology {
 			// if the incoming is from topology but the existing is from Pelican
-			log.Debugf("The ServerAd generated from topology with name %s and URL %s was ignored because there's already a Pelican ad for this server", ad.Name, ad.URL.String())
+			log.Debugf("The ServerAd generated from topology with name %s and URL %s was ignored because there's already a Pelican ad for this server", sAd.Name, sAd.URL.String())
 			return
 		}
-		if !ad.FromTopology && existing.Value().FromTopology {
+		if !sAd.FromTopology && existing.Value().FromTopology {
 			// Pelican server will overwrite topology one. We leave a message to let admin know
-			log.Debugf("The existing ServerAd generated from topology with name %s and URL %s is replaced by the Pelican server with name %s", existing.Value().Name, existing.Value().URL.String(), ad.Name)
+			log.Debugf("The existing ServerAd generated from topology with name %s and URL %s is replaced by the Pelican server with name %s", existing.Value().Name, existing.Value().URL.String(), sAd.Name)
 			serverAds.Delete(existing.Value().URL.String())
+		}
+		if !sAd.FromTopology && !existing.Value().FromTopology { // Only copy the IO Load value for Pelican server
+			sAd.IOLoad = existing.Value().GetIOLoad() // we copy the value from the existing serverAD to be consistent
 		}
 	}
 
+	ad := server_structs.Advertisement{ServerAd: sAd, NamespaceAds: *namespaceAds}
+
 	customTTL := param.Director_AdvertisementTTL.GetDuration()
-	if customTTL == 0 {
-		serverAds.Set(ad.URL.String(), &server_structs.Advertisement{ServerAd: ad, NamespaceAds: *namespaceAds}, ttlcache.DefaultTTL)
-	} else {
-		serverAds.Set(ad.URL.String(), &server_structs.Advertisement{ServerAd: ad, NamespaceAds: *namespaceAds}, customTTL)
+
+	serverAds.Set(ad.URL.String(), &server_structs.Advertisement{ServerAd: sAd, NamespaceAds: *namespaceAds}, customTTL)
+
+	// Prepare `stat` call utilities for all servers regardless of its source (topology or Pelican)
+	statUtilsMutex.Lock()
+	defer statUtilsMutex.Unlock()
+	statUtil, ok := statUtils[ad.URL.String()]
+	if !ok || statUtil.Errgroup == nil {
+		baseCtx, cancel := context.WithCancel(ctx)
+		concLimit := param.Director_StatConcurrencyLimit.GetInt()
+		// If the value is not set, set to -1 to remove the limit
+		if concLimit == 0 {
+			concLimit = -1
+		}
+		statErrGrp := errgroup.Group{}
+		statErrGrp.SetLimit(concLimit)
+		newUtil := serverStatUtil{
+			Errgroup: &statErrGrp,
+			Cancel:   cancel,
+			Context:  baseCtx,
+		}
+		statUtils[ad.URL.String()] = newUtil
 	}
+
+	// Prepare and launch the director file transfer tests to the origins/caches if it's not from the topology AND it's not already been registered
+	healthTestUtilsMutex.Lock()
+	defer healthTestUtilsMutex.Unlock()
+	if ad.FromTopology {
+		return sAd
+	}
+
+	if existingUtil, ok := healthTestUtils[ad.URL.String()]; ok {
+		// Existing registration
+		if existingUtil != nil {
+			if existingUtil.ErrGrp != nil {
+				if existingUtil.ErrGrpContext.Err() != nil {
+					// ErrGroup has been Done. Start a new one
+					errgrp, errgrpCtx := errgroup.WithContext(ctx)
+					cancelCtx, cancel := context.WithCancel(errgrpCtx)
+
+					errgrp.SetLimit(1)
+					healthTestUtils[ad.URL.String()] = &healthTestUtil{
+						Cancel:        cancel,
+						ErrGrp:        errgrp,
+						ErrGrpContext: errgrpCtx,
+						Status:        HealthStatusInit,
+					}
+					errgrp.Go(func() error {
+						LaunchPeriodicDirectorTest(cancelCtx, sAd)
+						return nil
+					})
+					log.Debugf("New director test suite issued for %s %s. Errgroup was evicted", string(ad.Type), ad.URL.String())
+				} else {
+					cancelCtx, cancel := context.WithCancel(existingUtil.ErrGrpContext)
+					started := existingUtil.ErrGrp.TryGo(func() error {
+						LaunchPeriodicDirectorTest(cancelCtx, sAd)
+						return nil
+					})
+					if !started {
+						cancel()
+						log.Debugf("New director test suite blocked for %s %s, existing test has been running", string(ad.Type), ad.URL.String())
+					} else {
+						log.Debugf("New director test suite issued for %s %s. Existing registration", string(ad.Type), ad.URL.String())
+						existingUtil.Cancel()
+						existingUtil.Cancel = cancel
+					}
+				}
+			} else {
+				log.Errorf("%s %s registration didn't start a new director test cycle: errgroup is nil", string(ad.Type), &ad.URL)
+			}
+		} else {
+			log.Errorf("%s %s registration didn't start a new director test cycle: healthTestUtils item is nil", string(ad.Type), &ad.URL)
+		}
+	} else { // No healthTestUtils found, new registration
+		errgrp, errgrpCtx := errgroup.WithContext(ctx)
+		cancelCtx, cancel := context.WithCancel(errgrpCtx)
+
+		errgrp.SetLimit(1)
+		healthTestUtils[ad.URL.String()] = &healthTestUtil{
+			Cancel:        cancel,
+			ErrGrp:        errgrp,
+			ErrGrpContext: errgrpCtx,
+			Status:        HealthStatusInit,
+		}
+		errgrp.Go(func() error {
+			LaunchPeriodicDirectorTest(cancelCtx, sAd)
+			return nil
+		})
+	}
+
+	return sAd
 }
 
 func updateLatLong(ad *server_structs.ServerAd) error {

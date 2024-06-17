@@ -53,8 +53,10 @@ import (
 	"golang.org/x/time/rate"
 
 	"github.com/pelicanplatform/pelican/config"
+	"github.com/pelicanplatform/pelican/error_codes"
 	"github.com/pelicanplatform/pelican/namespaces"
 	"github.com/pelicanplatform/pelican/param"
+	"github.com/pelicanplatform/pelican/utils"
 )
 
 var (
@@ -85,6 +87,8 @@ var (
 			return item
 		},
 	)
+
+	PelicanError error_codes.PelicanError
 )
 
 type (
@@ -97,7 +101,10 @@ type (
 
 	// Error type for when the transfer started to return data then completely stopped
 	StoppedTransferError struct {
-		Err error
+		BytesTransferred int64
+		StoppedTime      time.Duration
+		CacheHit         bool
+		Upload           bool
 	}
 
 	// SlowTransferError is an error that is returned when a transfer takes longer than the configured timeout
@@ -106,6 +113,7 @@ type (
 		BytesPerSecond   int64
 		BytesTotal       int64
 		Duration         time.Duration
+		CacheAge         time.Duration
 	}
 
 	// ConnectionSetupError is an error that is returned when a connection to the remote server fails
@@ -113,6 +121,8 @@ type (
 		URL string
 		Err error
 	}
+
+	HeaderTimeoutError struct{}
 
 	allocateMemoryError struct {
 		Err error
@@ -141,12 +151,13 @@ type (
 	// Represents the results of a single object transfer,
 	// potentially across multiple attempts / retries.
 	TransferResults struct {
-		jobId            uuid.UUID // The job ID this result corresponds to
-		job              *TransferJob
-		Error            error
-		TransferredBytes int64
-		Scheme           string
-		Attempts         []TransferResult
+		jobId             uuid.UUID // The job ID this result corresponds to
+		job               *TransferJob
+		Error             error
+		TransferredBytes  int64
+		TransferStartTime time.Time
+		Scheme            string
+		Attempts          []TransferResult
 	}
 
 	TransferResult struct {
@@ -155,6 +166,7 @@ type (
 		TimeToFirstByte   time.Duration // how long it took to download the first byte
 		TransferEndTime   time.Time     // when the transfer ends
 		TransferTime      time.Duration // amount of time we were transferring per attempt (in seconds)
+		CacheAge          time.Duration // age of the data reported by the cache
 		Endpoint          string        // which origin did it use
 		ServerVersion     string        // version of the server
 		Error             error         // what error the attempt returned (if any)
@@ -178,6 +190,12 @@ type (
 
 		// Specifies the pack option in the transfer URL
 		PackOption string
+
+		// Cache age, if known
+		CacheAge time.Duration
+
+		// Whether or not the cache has been queried
+		CacheQuery bool
 	}
 
 	// A structure representing a single file to transfer.
@@ -316,12 +334,25 @@ func getProgressContainer() *mpb.Progress {
 	return progressCtr
 }
 
-func (e *StoppedTransferError) Error() string {
-	return e.Err.Error()
+func (e *HeaderTimeoutError) Error() string {
+	return "timeout waiting for HTTP response (TCP connection successful)"
 }
 
-func (e *StoppedTransferError) Unwrap() error {
-	return e.Err
+func (e *StoppedTransferError) Error() (errMsg string) {
+	if e.StoppedTime > 0 {
+		errMsg = "no progress for more than " + e.StoppedTime.Truncate(time.Millisecond).String()
+	} else {
+		errMsg = "no progress"
+	}
+	errMsg += " after " + ByteCountSI(e.BytesTransferred) + " transferred"
+	if !e.Upload {
+		if e.CacheHit {
+			errMsg += " (cache hit)"
+		} else {
+			errMsg += " (cache miss)"
+		}
+	}
+	return
 }
 
 func (e *StoppedTransferError) Is(target error) bool {
@@ -364,13 +395,19 @@ func (e *HttpErrResp) Error() string {
 	return e.Err
 }
 
-func (e *SlowTransferError) Error() string {
-	return "cancelled transfer, too slow.  Detected speed: " +
+func (e *SlowTransferError) Error() (errMsg string) {
+	errMsg = "cancelled transfer, too slow; detected speed=" +
 		ByteCountSI(e.BytesPerSecond) +
-		"/s, total transferred: " +
+		"/s, total transferred=" +
 		ByteCountSI(e.BytesTransferred) +
-		", total transfer time: " +
-		e.Duration.String()
+		", total transfer time=" +
+		e.Duration.Round(time.Millisecond).String()
+	if e.CacheAge == 0 {
+		errMsg += ", cache miss"
+	} else if e.CacheAge > 0 {
+		errMsg += ", cache hit"
+	}
+	return
 }
 
 func (e *SlowTransferError) Is(target error) bool {
@@ -417,6 +454,9 @@ func (e *ConnectionSetupError) Is(target error) bool {
 }
 
 func (e *StatusCodeError) Error() string {
+	if int(*e) == http.StatusGatewayTimeout {
+		return "cache timed out waiting on origin"
+	}
 	return (*grab.StatusCodeError)(e).Error()
 }
 
@@ -463,6 +503,20 @@ func (tae *TransferAttemptError) Is(target error) bool {
 		return false
 	}
 	return tae.isUpload == other.isUpload && tae.serviceHost == other.serviceHost && tae.isProxyErr == other.isProxyErr && tae.proxyHost == other.proxyHost
+}
+
+func compatToDuration(dur time.Duration, paramName string) (result time.Duration) {
+	// Backward compat: some parameters were previously integers, in seconds.
+	// If you give viper an integer without a suffix then it interprets it as a
+	// number in *nanoseconds*.  We assume that's not the intent and, if under a
+	// microsecond, assume that the user really meant seconds.
+	if dur < time.Microsecond {
+		log.Warningf("%s must be given as a duration, not an integer; try setting it as '%ds'", paramName, dur.Nanoseconds())
+		result = time.Duration(dur.Nanoseconds()) * time.Second
+	} else {
+		result = dur
+	}
+	return
 }
 
 func newTransferAttemptError(service string, proxy string, isProxyErr bool, isUpload bool, err error) (tae *TransferAttemptError) {
@@ -1098,48 +1152,11 @@ func (tc *TransferClient) NewTransferJob(ctx context.Context, remoteUrl *url.URL
 	// If we are a recursive download and using the director, we want to attempt to get directory listings from
 	// PROPFINDing the director
 	if recursive && !upload && tj.useDirector {
-		// Query the director a PROPFIND to see if we can get our directory listing
-		resp, err := queryDirector(tj.ctx, "PROPFIND", remoteUrl.Path, tj.directorUrl)
+		dirListHost, err := getCollectionsUrl(tj.ctx, remoteUrl, tj.namespace, tj.directorUrl)
 		if err != nil {
-			if resp.StatusCode == http.StatusNotFound {
-				// If we have an issue querying the director, we want to fallback to the deprecated dirlisthost from the namespace
-				// At this point, we have already queried the director (and it should have succeeded if we are here) so the error
-				// we get is most likely an issue with PROPFIND (and an outdated director). So we should try to continue.
-				if tj.namespace.DirListHost == "" {
-					err = &dirListingNotSupportedError{Err: errors.New("origin and/or namespace does not support directory listings")}
-					return nil, err
-				}
-			}
-		} else if resp.StatusCode == http.StatusMethodNotAllowed {
-			// If the director responds with 405 (method not allowed), we're working with an old Director.
-			// In that event, we try to fallback and use the deprecated dirlisthost
-			log.Debugln("Failed to find collections url from director, attempting to find directory listings host in namespace")
-			// Check for a dir list host in namespace
-			if tj.namespace.DirListHost == "" {
-				// Both methods to get directory listings failed
-				err = &dirListingNotSupportedError{Err: errors.New("origin and/or namespace does not support directory listings")}
-				return nil, err
-			}
-		} else if resp.StatusCode == http.StatusTemporaryRedirect {
-			// If the director responds with a 307 (temporary redirect), we're working with a new Director.
-			// In that event, we can get the collections URL from our redirect
-			collections := resp.Header.Get("Location")
-			if collections == "" {
-				return nil, errors.New("collections URL not found in director response")
-			}
-			// The resp redirect includes the full path to the object from the origin, we are only interested in the scheme and host
-			collectionsURL, err := url.Parse(collections)
-			if err != nil {
-				return nil, err
-			}
-			dirlisthost := url.URL{
-				Scheme: collectionsURL.Scheme,
-				Host:   collectionsURL.Host,
-			}
-			tj.namespace.DirListHost = dirlisthost.String()
-		} else {
-			return nil, fmt.Errorf("unexpected response from director when requesting collections url from origin: %v", resp.Status)
+			return nil, err
 		}
+		tj.namespace.DirListHost = dirListHost.String()
 	}
 
 	log.Debugf("Created new transfer job, ID %s client %s, for URL %s", tj.uuid.String(), tc.id.String(), remoteUrl.String())
@@ -1414,11 +1431,11 @@ func (te *TransferEngine) createTransferFiles(job *clientTransferJob) (err error
 		if cachesToTry > len(closestNamespaceCaches) {
 			cachesToTry = len(closestNamespaceCaches)
 		}
-
+		log.Debugf("Trying the first %d caches", cachesToTry)
 		transfers = getCachesToTry(closestNamespaceCaches, job.job, cachesToTry, packOption)
 
 		if len(transfers) > 0 {
-			log.Debugln("Transfers:", transfers[0].Url)
+			log.Traceln("First transfer in list:", transfers[0].Url)
 		} else {
 			log.Debugln("No transfers possible as no caches are found")
 			err = errors.New("No transfers possible as no caches are found")
@@ -1528,11 +1545,22 @@ func sortAttempts(ctx context.Context, path string, attempts []transferAttemptDe
 		return
 	}
 	transport := config.GetTransport()
-	headChan := make(chan struct {
+	type checkResults struct {
 		idx  int
 		size uint64
+		age  int
 		err  error
-	})
+	}
+	headChan := make(chan checkResults)
+
+	if log.IsLevelEnabled(log.DebugLevel) {
+		attemptHosts := make([]string, len(attempts))
+		for idx, host := range attempts {
+			attemptHosts[idx] = host.Url.Host
+		}
+		log.Debugln("Will query the following endpoints for availability:", strings.Join(attemptHosts, ", "))
+	}
+
 	defer close(headChan)
 	ctx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
@@ -1540,36 +1568,59 @@ func sortAttempts(ctx context.Context, path string, attempts []transferAttemptDe
 		tUrl := *transferEndpoint.Url
 		tUrl.Path = path
 
-		go func(idx int, tUrl string) {
+		go func(idx int, tUrl *url.URL) {
+			// If the scheme is unix://, it is a local cache and therefore, we should always try this cache first and skip the HEAD request (since it will fail)
+			if tUrl.Scheme == "unix" {
+				headChan <- checkResults{idx, 0, -1, nil}
+				return
+			}
+
 			headClient := &http.Client{Transport: transport}
-			headRequest, _ := http.NewRequestWithContext(ctx, http.MethodHead, tUrl, nil)
+			// Note we are not using a HEAD request here but a GET request for one byte;
+			// this is because the XRootD server currently (v5.6.9) only returns the Age
+			// header for GETs
+			headRequest, _ := http.NewRequestWithContext(ctx, http.MethodGet, tUrl.String(), nil)
+			headRequest.Header.Set("Range", "0-0")
 			var headResponse *http.Response
 			headResponse, err := headClient.Do(headRequest)
 			if err != nil {
-				headChan <- struct {
-					idx  int
-					size uint64
-					err  error
-				}{idx, 0, err}
+				headChan <- checkResults{idx, 0, -1, err}
 				return
 			}
+			// Allow response body to fail to read; we are only interested in the headers
+			// of the response, not the contents.
+			if _, err := io.ReadAll(headResponse.Body); err != nil {
+				log.Warningln("Failure when reading the one-byte-response body:", err)
+			}
 			headResponse.Body.Close()
-			contentLengthStr := headResponse.Header.Get("Content-Length")
-			size := int64(0)
-			if contentLengthStr != "" {
-				size, err = strconv.ParseInt(contentLengthStr, 10, 64)
-				if err != nil {
-					err = errors.Wrap(err, "problem converting Content-Length in response to an int")
-					log.Errorln(err.Error())
+			var age int = -1
+			var size int64 = 0
+			if headResponse.StatusCode <= 300 {
+				contentLengthStr := headResponse.Header.Get("Content-Length")
+				if contentLengthStr != "" {
+					size, err = strconv.ParseInt(contentLengthStr, 10, 64)
+					if err != nil {
+						err = errors.Wrap(err, "problem converting Content-Length in response to an int")
+						log.Errorln(err.Error())
 
+					}
+				}
+				ageStr := headResponse.Header.Get("Age")
+				if ageStr != "" {
+					if ageParsed, err := strconv.Atoi(ageStr); err != nil {
+						log.Warningf("Ignoring invalid age value (%s) due to parsing error: %s", headRequest.Header.Get("Age"), err.Error())
+					} else {
+						age = ageParsed
+					}
+				}
+			} else {
+				err = &HttpErrResp{
+					Code: headResponse.StatusCode,
+					Err:  fmt.Sprintf("GET \"%s\" resulted in status code %d", tUrl, headResponse.StatusCode),
 				}
 			}
-			headChan <- struct {
-				idx  int
-				size uint64
-				err  error
-			}{idx, uint64(size), err}
-		}(idx, tUrl.String())
+			headChan <- checkResults{idx, uint64(size), age, err}
+		}(idx, &tUrl)
 	}
 	// 1 -> success.
 	// 0 -> pending.
@@ -1578,20 +1629,31 @@ func sortAttempts(ctx context.Context, path string, attempts []transferAttemptDe
 	for ctr := 0; ctr != len(attempts); ctr++ {
 		result := <-headChan
 		if result.err != nil {
-			if result.err != context.Canceled {
-				log.Debugf("Failure when doing a HEAD request against %s: %s", attempts[result.idx].Url.String(), result.err.Error())
+			// If an attempt to contact the remote cache failed, log a message (unless we purposely
+			// canceled the attempt).
+			if !errors.Is(result.err, context.Canceled) && !errors.Is(result.err, context.DeadlineExceeded) {
+				log.Debugf("Failure when doing a GET request to see if %s is functioning: %s", attempts[result.idx].Url.String(), result.err.Error())
 				finished[result.idx] = -1
+			} else if errors.Is(result.err, context.DeadlineExceeded) {
+				log.Debugf("Timed out when querying to see if %s is functioning", attempts[result.idx].Url.String())
 			}
 		} else {
 			finished[result.idx] = 1
-			if result.idx == 0 {
+			if result.age >= 0 {
+				attempts[result.idx].CacheAge = time.Duration(result.age) * time.Second
+				attempts[result.idx].CacheQuery = true
+			}
+			if result.idx == 0 && result.err == nil {
 				cancel()
 				// If the first responds successfully, we want to return immediately instead of giving
 				// the other caches time to respond - the result is "good enough".
 				// - Any cache with confirmed errors (-1) is sorted to the back.
 				// - Any cache which is still pending (0) is kept in place.
+				log.Debugf("First available cache (%s) responded; will ignore remaining attempts", attempts[result.idx].Url.Host)
 				for ctr := 0; ctr < len(attempts); ctr++ {
-					finished[ctr] = 1
+					if finished[ctr] != -1 {
+						finished[ctr] = 1
+					}
 				}
 			}
 			if size <= int64(result.size) {
@@ -1641,20 +1703,30 @@ func downloadObject(transfer *transferFile) (transferResults TransferResults, er
 	transferResults = newTransferResults(transfer.job)
 	xferErrors := NewTransferErrors()
 	success := false
+	// transferStartTime is the start time of the last transfer attempt
+	// we create a var here and update it in the loop
+	var transferStartTime time.Time
 	for idx, transferEndpoint := range attempts { // For each transfer attempt (usually 3), try to download via HTTP
 		var attempt TransferResult
+		attempt.CacheAge = -1
 		attempt.Number = idx // Start with 0
 		attempt.Endpoint = transferEndpoint.Url.Host
+		if transferEndpoint.CacheQuery {
+			attempt.CacheAge = transferEndpoint.CacheAge
+		}
 		// Make a copy of the transfer endpoint URL; otherwise, when we mutate the pointer, other parallel
 		// workers might download from the wrong path.
 		transferEndpointUrl := *transferEndpoint.Url
 		transferEndpointUrl.Path = transfer.remoteURL.Path
 		transferEndpoint.Url = &transferEndpointUrl
-		transferStartTime := time.Now()
-		attemptDownloaded, timeToFirstByte, serverVersion, err := downloadHTTP(
+		transferStartTime = time.Now() // Update start time for this attempt
+		attemptDownloaded, timeToFirstByte, cacheAge, serverVersion, err := downloadHTTP(
 			transfer.ctx, transfer.engine, transfer.callback, transferEndpoint, transfer.localPath, size, transfer.token, transfer.project,
 		)
 		endTime := time.Now()
+		if cacheAge >= 0 {
+			attempt.CacheAge = cacheAge
+		}
 		attempt.TransferEndTime = endTime
 		attempt.TransferTime = endTime.Sub(transferStartTime)
 		attempt.ServerVersion = serverVersion
@@ -1682,6 +1754,13 @@ func downloadObject(transfer *transferFile) (transferResults TransferResults, er
 			} else if errors.As(err, &cse) {
 				if sce, ok := cse.Unwrap().(*StatusCodeError); ok {
 					attempt.Error = newTransferAttemptError(serviceStr, proxyStr, false, false, sce)
+				} else if ue, ok := cse.Unwrap().(*url.Error); ok {
+					httpErr := ue.Unwrap()
+					if httpErr.Error() == "net/http: timeout awaiting response headers" {
+						attempt.Error = newTransferAttemptError(serviceStr, proxyStr, false, false, &HeaderTimeoutError{})
+					} else {
+						attempt.Error = newTransferAttemptError(serviceStr, proxyStr, false, false, httpErr)
+					}
 				} else {
 					attempt.Error = newTransferAttemptError(serviceStr, proxyStr, false, false, err)
 				}
@@ -1698,6 +1777,7 @@ func downloadObject(transfer *transferFile) (transferResults TransferResults, er
 			break
 		}
 	}
+	transferResults.TransferStartTime = transferStartTime
 	transferResults.TransferredBytes = downloaded
 	if !success {
 		transferResults.Error = xferErrors
@@ -1722,7 +1802,7 @@ func parseTransferStatus(status string) (int, string) {
 // Perform the actual download of the file
 //
 // Returns the downloaded size, time to 1st byte downloaded, serverVersion and an error if there is one
-func downloadHTTP(ctx context.Context, te *TransferEngine, callback TransferCallbackFunc, transfer transferAttemptDetails, dest string, totalSize int64, token string, project string) (downloaded int64, timeToFirstByte time.Duration, serverVersion string, err error) {
+func downloadHTTP(ctx context.Context, te *TransferEngine, callback TransferCallbackFunc, transfer transferAttemptDetails, dest string, totalSize int64, token string, project string) (downloaded int64, timeToFirstByte time.Duration, cacheAge time.Duration, serverVersion string, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Errorln("Panic occurred in downloadHTTP:", r)
@@ -1730,6 +1810,9 @@ func downloadHTTP(ctx context.Context, te *TransferEngine, callback TransferCall
 			err = errors.New(ret)
 		}
 	}()
+
+	// Negative cache age indicates no Age response header was received
+	cacheAge = -1
 
 	lastUpdate := time.Now()
 	if callback != nil {
@@ -1770,7 +1853,7 @@ func downloadHTTP(ctx context.Context, te *TransferEngine, callback TransferCall
 	}
 	httpClient, ok := client.HTTPClient.(*http.Client)
 	if !ok {
-		return 0, 0, "", errors.New("Internal error: implementation is not a http.Client type")
+		return 0, 0, -1, "", errors.New("Internal error: implementation is not a http.Client type")
 	}
 	httpClient.Transport = transport
 	headerTimeout := transport.ResponseHeaderTimeout
@@ -1789,20 +1872,20 @@ func downloadHTTP(ctx context.Context, te *TransferEngine, callback TransferCall
 	if transfer.PackOption != "" {
 		behavior, err := GetBehavior(transfer.PackOption)
 		if err != nil {
-			return 0, 0, "", err
+			return 0, 0, -1, "", err
 		}
 		if dest == "." {
 			dest, err = os.Getwd()
 			if err != nil {
-				return 0, 0, "", errors.Wrap(err, "Failed to get current directory for destination")
+				return 0, 0, -1, "", errors.Wrap(err, "Failed to get current directory for destination")
 			}
 		}
 		unpacker = newAutoUnpacker(dest, behavior)
 		if req, err = grab.NewRequestToWriter(unpacker, transferUrl.String()); err != nil {
-			return 0, 0, "", errors.Wrap(err, "Failed to create new download request")
+			return 0, 0, -1, "", errors.Wrap(err, "Failed to create new download request")
 		}
 	} else if req, err = grab.NewRequest(dest, transferUrl.String()); err != nil {
-		return 0, 0, "", errors.Wrap(err, "Failed to create new download request")
+		return 0, 0, -1, "", errors.Wrap(err, "Failed to create new download request")
 	}
 
 	rateLimit := param.Client_MaximumDownloadSpeed.GetInt()
@@ -1823,8 +1906,8 @@ func downloadHTTP(ctx context.Context, te *TransferEngine, callback TransferCall
 	req.HTTPRequest.Header.Set("User-Agent", getUserAgent(project))
 	req = req.WithContext(ctx)
 
-	// Test the transfer speed every 5 seconds
-	t := time.NewTicker(5000 * time.Millisecond)
+	// Test the transfer speed every 0.5 seconds
+	t := time.NewTicker(500 * time.Millisecond)
 	defer t.Stop()
 
 	// Progress ticker
@@ -1859,6 +1942,19 @@ func downloadHTTP(ctx context.Context, te *TransferEngine, callback TransferCall
 	}
 	serverVersion = resp.HTTPResponse.Header.Get("Server")
 
+	if ageStr := resp.HTTPResponse.Header.Get("Age"); ageStr != "" {
+		if ageSec, err := strconv.Atoi(ageStr); err == nil {
+			cacheAge = time.Duration(ageSec) * time.Second
+		} else {
+			log.Debugf("Server at %s gave unparseable Age header (%s) in response: %s", transfer.Url.Host, ageStr, err.Error())
+		}
+	}
+	if cacheAge == 0 {
+		log.Debugln("Server at", transfer.Url.Host, "had a cache miss")
+	} else if cacheAge > 0 {
+		log.Debugln("Server at", transfer.Url.Host, "had a cache hit with data age", cacheAge.String())
+	}
+
 	// Size of the download
 	totalSize = resp.Size()
 	// Do a head request for content length if resp.Size is unknown
@@ -1886,10 +1982,12 @@ func downloadHTTP(ctx context.Context, te *TransferEngine, callback TransferCall
 		callback(dest, 0, totalSize, false)
 	}
 
-	stoppedTransferTimeout := int64(param.Client_StoppedTransferTimeout.GetInt())
-	slowTransferRampupTime := int64(param.Client_SlowTransferRampupTime.GetInt())
-	slowTransferWindow := int64(param.Client_SlowTransferWindow.GetInt())
-	var startBelowLimit int64 = 0
+	stoppedTransferTimeout := compatToDuration(param.Client_StoppedTransferTimeout.GetDuration(), "Client.StoppedTranferTimeout")
+	slowTransferRampupTime := compatToDuration(param.Client_SlowTransferRampupTime.GetDuration(), "Client.SlowTransferRampupTime")
+	slowTransferWindow := compatToDuration(param.Client_SlowTransferWindow.GetDuration(), "Client.SlowTransferWindow")
+	log.Debugf("Stopped transfer timeout is %s; slow transfer ramp-up is %s; slow transfer look-back window is %s",
+		stoppedTransferTimeout.String(), slowTransferRampupTime.String(), slowTransferWindow.String())
+	startBelowLimit := time.Time{}
 	var noProgressStartTime time.Time
 	var lastBytesComplete int64
 	timeToFirstByteRecorded := false
@@ -1919,12 +2017,13 @@ Loop:
 			if downloaded == lastBytesComplete {
 				if noProgressStartTime.IsZero() {
 					noProgressStartTime = time.Now()
-				} else if time.Since(noProgressStartTime) > time.Duration(stoppedTransferTimeout)*time.Second {
-					errMsg := "No progress for more than " + time.Since(noProgressStartTime).Truncate(time.Millisecond).String()
-					log.Errorln(errMsg)
+				} else if time.Since(noProgressStartTime) > stoppedTransferTimeout {
 					err = &StoppedTransferError{
-						Err: errors.New(errMsg),
+						BytesTransferred: downloaded,
+						StoppedTime:      time.Since(noProgressStartTime),
+						CacheHit:         cacheAge > 0,
 					}
+					log.Errorln(err.Error())
 					return
 				}
 			} else {
@@ -1943,37 +2042,39 @@ Loop:
 			}
 			if resp.BytesPerSecond() < limit {
 				// Give the download `slowTransferRampupTime` (default 120) seconds to start
-				if resp.Duration() < time.Second*time.Duration(slowTransferRampupTime) {
+				if resp.Duration() < slowTransferRampupTime {
 					continue
-				} else if startBelowLimit == 0 {
+				} else if startBelowLimit.IsZero() {
 					warning := []byte("Warning! Downloading too slow...\n")
 					status, err := getProgressContainer().Write(warning)
 					if err != nil {
 						log.Errorln("Problem displaying slow message", err, status)
 						continue
 					}
-					startBelowLimit = time.Now().Unix()
+					startBelowLimit = time.Now()
 					continue
-				} else if (time.Now().Unix() - startBelowLimit) < slowTransferWindow {
+				} else if time.Since(startBelowLimit) < slowTransferWindow {
 					// If the download is below the threshold for less than `SlowTransferWindow` (default 30) seconds, continue
 					continue
 				}
 				// The download is below the threshold for more than `SlowTransferWindow` seconds, cancel the download
 				cancel()
 
-				log.Errorln("Cancelled: Download speed of ", resp.BytesPerSecond(), "bytes/s", " is below the limit of", downloadLimit, "bytes/s")
+				log.Errorf("Cancelled: Download speed of %s/s is below the limit of %s/s", ByteCountSI(int64(resp.BytesPerSecond())), ByteCountSI(int64(downloadLimit)))
 
 				err = &SlowTransferError{
 					BytesTransferred: resp.BytesComplete(),
 					BytesPerSecond:   int64(resp.BytesPerSecond()),
 					Duration:         resp.Duration(),
 					BytesTotal:       totalSize,
+					CacheAge:         cacheAge,
 				}
+				err = error_codes.NewTransfer_SlowTransferError(err)
 				return
 
 			} else {
 				// The download is fast enough, reset the startBelowLimit
-				startBelowLimit = 0
+				startBelowLimit = time.Time{}
 			}
 
 		case <-resp.Done:
@@ -2008,7 +2109,7 @@ Loop:
 	// prior attempt.
 	if resp.HTTPResponse.StatusCode != 200 && resp.HTTPResponse.StatusCode != 206 {
 		log.Debugln("Got failure status code:", resp.HTTPResponse.StatusCode)
-		return 0, 0, serverVersion, &HttpErrResp{resp.HTTPResponse.StatusCode, fmt.Sprintf("Request failed (HTTP status %d): %s",
+		return 0, 0, -1, serverVersion, &HttpErrResp{resp.HTTPResponse.StatusCode, fmt.Sprintf("Request failed (HTTP status %d): %s",
 			resp.HTTPResponse.StatusCode, resp.Err().Error())}
 	}
 
@@ -2081,11 +2182,11 @@ func uploadObject(transfer *transferFile) (transferResult TransferResults, err e
 	transferResult.job = transfer.job
 
 	var sizer Sizer = &ConstantSizer{size: 0}
-	var downloaded int64 = 0
+	var uploaded int64 = 0
 	if transfer.callback != nil {
-		transfer.callback(transfer.localPath, downloaded, sizer.Size(), false)
+		transfer.callback(transfer.localPath, 0, sizer.Size(), false)
 		defer func() {
-			transfer.callback(transfer.localPath, downloaded, sizer.Size(), true)
+			transfer.callback(transfer.localPath, uploaded, sizer.Size(), true)
 		}()
 	}
 
@@ -2132,7 +2233,7 @@ func uploadObject(transfer *transferFile) (transferResult TransferResults, err e
 		nonZeroSize = fileInfo.Size() > 0
 	}
 	if transfer.callback != nil {
-		transfer.callback(transfer.localPath, downloaded, sizer.Size(), false)
+		transfer.callback(transfer.localPath, 0, sizer.Size(), false)
 	}
 
 	// Parse the writeback host as a URL
@@ -2172,14 +2273,14 @@ func uploadObject(transfer *transferFile) (transferResult TransferResults, err e
 		request.Header.Set("X-Pelican-JobId", searchJobAd(jobId))
 	}
 	var lastKnownWritten int64
-	t := time.NewTicker(20 * time.Second)
-	defer t.Stop()
 	uploadStart := time.Now()
 
 	go runPut(request, responseChan, errorChan)
 	var lastError error = nil
 
 	tickerDuration := 100 * time.Millisecond
+	stoppedTransferTimeout := compatToDuration(param.Client_StoppedTransferTimeout.GetDuration(), "Client.StoppedTransferTimeout")
+	lastProgress := uploadStart
 	progressTicker := time.NewTicker(tickerDuration)
 	firstByteRecorded := false
 	defer progressTicker.Stop()
@@ -2194,22 +2295,26 @@ Loop:
 		}
 		select {
 		case <-progressTicker.C:
+			uploaded = reader.BytesComplete()
 			if transfer.callback != nil {
-				transfer.callback(transfer.localPath, reader.BytesComplete(), sizer.Size(), false)
+				transfer.callback(transfer.localPath, uploaded, sizer.Size(), false)
 			}
+			// Check to see if we are making progress
 
-		case <-t.C:
-			// If we are not making any progress, if we haven't written 1MB in the last 5 seconds
-			currentRead := reader.BytesComplete()
-			log.Debugln("Current read:", currentRead)
-			log.Debugln("Last known written:", lastKnownWritten)
-			if lastKnownWritten < currentRead {
+			timeSinceLastProgress := time.Since(lastProgress)
+			if lastKnownWritten < uploaded {
 				// We have made progress!
-				lastKnownWritten = currentRead
-			} else {
+				lastKnownWritten = uploaded
+				lastProgress = time.Now()
+			} else if timeSinceLastProgress > stoppedTransferTimeout {
+
+				log.Errorln("No progress made in last", timeSinceLastProgress.Round(time.Millisecond).String(), "in upload")
+				lastError = &StoppedTransferError{
+					BytesTransferred: uploaded,
+					StoppedTime:      timeSinceLastProgress,
+					Upload:           true,
+				}
 				// No progress has been made in the last 1 second
-				log.Errorln("No progress made in last 5 second in upload")
-				lastError = errors.New("upload cancelled, no progress in 5 seconds")
 				break Loop
 			}
 
@@ -2227,7 +2332,14 @@ Loop:
 			break Loop
 
 		case err := <-errorChan:
-			log.Warningln("Unexpected error when performing upload:", err)
+			log.Errorln("Unexpected error when performing upload:", err)
+			var ue *url.Error
+			if errors.As(err, &ue) {
+				err = ue.Unwrap()
+				if err.Error() == "net/http: timeout awaiting response headers" {
+					err = &HeaderTimeoutError{}
+				}
+			}
 			lastError = err
 			break Loop
 
@@ -2235,21 +2347,23 @@ Loop:
 	}
 
 	transferEndTime := time.Now()
-	if fileInfo.Size() == 0 {
+	uploaded = reader.BytesComplete()
+	transferResult.TransferredBytes = uploaded
+	attempt.TransferFileBytes = uploaded
+	if lastError != nil {
 		xferErrors.AddPastError(newTransferAttemptError(dest.Host, "", false, true, lastError), transferEndTime)
 		transferResult.Error = xferErrors
 		attempt.Error = lastError
 	} else {
-		bytesComplete := reader.BytesComplete()
-		log.Debugln("Uploaded bytes:", bytesComplete)
-		transferResult.TransferredBytes = bytesComplete
-		attempt.TransferFileBytes = bytesComplete
+		log.Debugf("Successful upload of %d bytes", uploaded)
 	}
 	// Add our attempt fields
 	attempt.TransferEndTime = transferEndTime
 	attempt.TransferTime = transferEndTime.Sub(transferStartTime)
 	transferResult.Attempts = append(transferResult.Attempts, attempt)
-	return transferResult, lastError
+	// Note: the top-level `err` (second return value) is only for cases where no
+	// transfers were attempted.  If we got here, it must be nil.
+	return transferResult, nil
 }
 
 // Actually perform the HTTP PUT request to the server.
@@ -2263,8 +2377,11 @@ func runPut(request *http.Request, responseChan chan<- *http.Response, errorChan
 	log.Debugf("Dumping request: %s", dump)
 	response, err := client.Do(request)
 	if err != nil {
-		log.Errorln("Error with PUT:", err)
+		if !errors.Is(err, context.Canceled) {
+			log.Errorln("Error with PUT:", err)
+		}
 		errorChan <- err
+		close(errorChan)
 		return
 	}
 	dump, _ = httputil.DumpResponse(response, true)
@@ -2284,12 +2401,102 @@ func runPut(request *http.Request, responseChan chan<- *http.Response, errorChan
 
 }
 
+// This function queries the director with a PROPFIND to attempt to get the 'collections url'. If a propfind is not allowed on the director
+// We fall back to the deprecated dirlisthost in the namespace
+func getCollectionsUrl(ctx context.Context, remoteObjectUrl *url.URL, namespace namespaces.Namespace, directorUrl string) (collectionsUrl *url.URL, err error) {
+	// If we are a recursive download and using the director, we want to attempt to get directory listings from
+	// PROPFINDing the director
+	if directorUrl != "" {
+		// Query the director a PROPFIND to see if we can get our directory listing
+		resp, err := queryDirector(ctx, "PROPFIND", remoteObjectUrl.Path, directorUrl)
+		if err != nil {
+			// If we have an issue querying the director, we want to fallback to the deprecated dirlisthost from the namespace
+			// At this point, we have already queried the director (and it should have succeeded if we are here) so the error
+			// we get is most likely an issue with PROPFIND (and an outdated director). Therefore, we should continue if we get a 404
+			if resp == nil || !(resp.StatusCode == http.StatusNotFound) {
+				// We did not get a 404 so we should return the error
+				return nil, err
+			}
+		}
+		if resp.StatusCode == http.StatusMethodNotAllowed || resp.StatusCode == http.StatusNotFound {
+			// If the director responds with 405 (method not allowed) or a 404 (not found), we're working with an old Director.
+			// In that event, we try to fallback and use the deprecated dirlisthost
+			log.Debugln("Failed to find collections url from director, attempting to find directory listings host in namespace")
+			// Check for a dir list host in namespace
+			if namespace.DirListHost == "" {
+				// Both methods to get directory listings failed
+				err = &dirListingNotSupportedError{Err: errors.New("origin and/or namespace does not support directory listings")}
+				return nil, err
+			} else {
+				collectionsUrl, err = url.Parse(namespace.DirListHost)
+				if err != nil {
+					return nil, err
+				}
+				return collectionsUrl, nil
+			}
+		} else if resp.StatusCode == http.StatusTemporaryRedirect {
+			// If the director responds with a 307 (temporary redirect), we're working with a new Director.
+			// In that event, we can get the collections URL from our redirect
+			collections := resp.Header.Get("Location")
+			if collections == "" {
+				return nil, errors.New("collections URL not found in director response")
+			}
+			collectionsUrl, err = url.Parse(collections)
+			if err != nil {
+				return nil, errors.Wrap(err, "failed to parse collections URL from the Location header")
+			}
+			// We don't want anything in path for the collections url
+			collectionsUrl.Path = ""
+			return collectionsUrl, nil
+		} else if resp.StatusCode == http.StatusMultiStatus {
+			// In 7.10, we plan to proxy PROPFIND at the director for origins enabled connection broker,
+			// which will respond with 207 instead of redirect client to the origin.
+			// In this case, read from X-Pelican-Namespace header
+			pelicanNamespaceHdr := resp.Header.Values("X-Pelican-Namespace")
+			if len(pelicanNamespaceHdr) == 0 {
+				err = errors.New("collections URL not found in director response: X-Pelican-Namespace header is missing in 207 response")
+				return nil, err
+			}
+			xPelicanNamespace := utils.HeaderParser(pelicanNamespaceHdr[0])
+			dirCollectionsUrl := xPelicanNamespace["collections-url"]
+
+			collectionsUrl, err = url.Parse(dirCollectionsUrl)
+			if err != nil {
+				return nil, errors.Wrap(err, "failed to parse collections URL from the X-Pelican-Namespace header")
+			}
+			return collectionsUrl, nil
+		} else {
+			return nil, errors.Errorf("unexpected response from director when requesting collections url from origin: %v", resp.Status)
+		}
+	} else if namespace.DirListHost != "" {
+		// If we're not using the director and are using topology, we should check for a dirlisthost from the namespace
+		collectionsUrl, err = url.Parse(namespace.DirListHost)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to parse directory listing host as a url")
+		}
+	} else {
+		// If we hit this point, we are not using the director and the namespace does not have a DirListHost therefore, the origin and/or namespace does not support it
+		err = &dirListingNotSupportedError{Err: errors.New("origin and/or namespace does not support directory listings")}
+		return nil, err
+	}
+	return
+}
+
+// This helper function creates a web dav client to walkDavDir's. Used for recursive downloads and lists
+func createWebDavClient(collectionsUrl *url.URL, token string, project string) (client *gowebdav.Client) {
+	auth := &bearerAuth{token: token}
+	client = gowebdav.NewAuthClient(collectionsUrl.String(), auth)
+	client.SetHeader("User-Agent", getUserAgent(project))
+	transport := config.GetTransport()
+	client.SetTransport(transport)
+	return
+}
+
 // Walk a remote directory in a WebDAV server, emitting the files discovered
 func (te *TransferEngine) walkDirDownload(job *clientTransferJob, transfers []transferAttemptDetails, files chan *clientTransferFile, url *url.URL) error {
 	// Create the client to walk the filesystem
 	rootUrl := *url
 	if job.job.namespace.DirListHost != "" {
-		// Parse the dir list host
 		dirListURL, err := url.Parse(job.job.namespace.DirListHost)
 		if err != nil {
 			log.Errorln("Failed to parse dirlisthost from namespaces into URL:", err)
@@ -2303,12 +2510,7 @@ func (te *TransferEngine) walkDirDownload(job *clientTransferJob, transfers []tr
 	}
 	log.Debugln("Dir list host: ", rootUrl.String())
 
-	auth := &bearerAuth{token: job.job.token}
-	client := gowebdav.NewAuthClient(rootUrl.String(), auth)
-
-	// XRootD does not like keep alives and kills things, so turn them off.
-	transport := config.GetTransport()
-	client.SetTransport(transport)
+	client := createWebDavClient(&rootUrl, job.job.token, job.job.project)
 	return te.walkDirDownloadHelper(job, transfers, files, url.Path, client)
 }
 
@@ -2409,53 +2611,110 @@ func (te *TransferEngine) walkDirUpload(job *clientTransferJob, transfers []tran
 	return err
 }
 
-// Invoke HEAD against a remote URL, using the provided namespace information
+// This function performs the ls command by walking through the specified directory and printing the contents of the files
+func listHttp(ctx context.Context, remoteObjectUrl *url.URL, directorUrl string, namespace namespaces.Namespace, token string) (fileInfos []FileInfo, err error) {
+	// Get our directory listing host
+	collectionsUrl, err := getCollectionsUrl(ctx, remoteObjectUrl, namespace, directorUrl)
+	if err != nil {
+		return
+	}
+	log.Debugln("Collections URL: ", collectionsUrl.String())
+
+	project := searchJobAd(projectName)
+	client := createWebDavClient(collectionsUrl, token, project)
+	remotePath := remoteObjectUrl.Path
+
+	infos, err := client.ReadDir(remotePath)
+	if err != nil {
+		// Check if we got a 404:
+		if gowebdav.IsErrNotFound(err) {
+			return nil, errors.New("404: object not found")
+		} else if gowebdav.IsErrCode(err, http.StatusInternalServerError) {
+			// If we get an error code 500 (internal server error), we should check if the user is trying to ls on a file
+			info, err := client.Stat(remotePath)
+			if err != nil {
+				return nil, errors.Wrap(err, "failed to stat remote path")
+			}
+			// If the path leads to a file and not a directory, just add the filename
+			if !info.IsDir() {
+				// NOTE: we implement our own FileInfo here because the one we get back from stat() does not have a .name field for some reason
+				file := FileInfo{
+					Name:    path.Base(remotePath),
+					Size:    info.Size(),
+					ModTime: info.ModTime(),
+					IsDir:   false,
+				}
+				fileInfos = append(fileInfos, file)
+				return fileInfos, nil
+			}
+		} else if gowebdav.IsErrCode(err, http.StatusMethodNotAllowed) {
+			// We replace the error from gowebdav with our own because gowebdav returns: "ReadDir /prefix/different-path/: 405" which is not very user friendly
+			return nil, errors.Errorf("405: object listings are not supported by the discovered origin. Contact your federation admin at %s for help", directorUrl)
+		}
+		// Otherwise, a different error occurred and we should return it
+		return nil, errors.Wrap(err, "failed to read remote directory")
+	}
+
+	for _, info := range infos {
+		// Create a FileInfo for the file and append it to the slice
+		file := FileInfo{
+			Name:    info.Name(),
+			Size:    info.Size(),
+			ModTime: info.ModTime(),
+			IsDir:   info.IsDir(),
+		}
+		fileInfos = append(fileInfos, file)
+	}
+	return fileInfos, nil
+}
+
+// Invoke a stat request against a remote URL that accepts WebDAV protocol,
+// using the provided namespace information
 //
 // If a "dirlist host" is given, then that is used for the namespace info.
 // Otherwise, the first three caches are queried simultaneously.
 // For any of the queries, if the attempt with the proxy fails, a second attempt
 // is made without.
-func statHttp(ctx context.Context, dest *url.URL, namespace namespaces.Namespace, token string) (size uint64, err error) {
+func statHttp(ctx context.Context, dest *url.URL, namespace namespaces.Namespace, directorUrl, token string) (info FileInfo, err error) {
 	statHosts := make([]url.URL, 0, 3)
-	if namespace.DirListHost != "" {
-		var endpoint *url.URL
-		endpoint, err = url.Parse(namespace.DirListHost)
-		if err != nil {
-			return
-		}
+	var dirListNotSupported *dirListingNotSupportedError
+	collectionsUrl, err := getCollectionsUrl(ctx, dest, namespace, directorUrl)
+	// If we have a dirListingNotSupported error, we can attempt to stat the caches instead
+	if err != nil && !errors.As(err, &dirListNotSupported) {
+		return
+	}
+	if collectionsUrl != nil {
+		endpoint := collectionsUrl
 		statHosts = append(statHosts, *endpoint)
 	} else if len(namespace.SortedDirectorCaches) > 0 {
 		for idx, cache := range namespace.SortedDirectorCaches {
 			if idx > 2 {
 				break
 			}
-			var endpoint *url.URL
-			endpoint, err = url.Parse(cache.EndpointUrl)
+			endpoint, err := url.Parse(cache.EndpointUrl)
 			if err != nil {
-				return
+				return info, err
 			}
+			endpoint.Path = ""
 			statHosts = append(statHosts, *endpoint)
 		}
 	} else if namespace.WriteBackHost != "" {
-		var endpoint *url.URL
-		endpoint, err = url.Parse(namespace.WriteBackHost)
+		endpoint, err := url.Parse(namespace.WriteBackHost)
 		if err != nil {
-			return
+			return info, err
 		}
 		statHosts = append(statHosts, *endpoint)
 	}
-
 	type statResults struct {
-		size uint64
+		info FileInfo
 		err  error
 	}
 	resultsChan := make(chan statResults)
 	transport := config.GetTransport()
-	client := &http.Client{Transport: transport}
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
+	auth := &bearerAuth{token: token}
 
 	for _, statUrl := range statHosts {
+		client := gowebdav.NewAuthClient(statUrl.String(), auth)
 		destCopy := *dest
 		destCopy.Host = statUrl.Host
 		destCopy.Scheme = statUrl.Scheme
@@ -2464,31 +2723,36 @@ func statHttp(ctx context.Context, dest *url.URL, namespace namespaces.Namespace
 			canDisableProxy := CanDisableProxy()
 			disableProxy := !isProxyEnabled()
 
-			var resp *http.Response
+			var info FileInfo
 			for {
 				if disableProxy {
-					log.Debugln("Performing HEAD (without proxy)", endpoint.String())
+					log.Debugln("Performing request (without proxy)", endpoint.String())
 					transport.Proxy = nil
 				} else {
-					log.Debugln("Performing HEAD", endpoint.String())
+					log.Debugln("Performing request", endpoint.String())
 				}
+				client.SetTransport(transport)
 
-				var req *http.Request
-				req, err = http.NewRequestWithContext(ctx, http.MethodHead, endpoint.String(), nil)
-				if err != nil {
-					log.Errorln("Failed to create HTTP request:", err)
-					resultsChan <- statResults{0, err}
+				fsinfo, err := client.Stat(endpoint.Path)
+				if err == nil {
+					info = FileInfo{
+						Name:    path.Base(endpoint.Path),
+						Size:    fsinfo.Size(),
+						IsDir:   fsinfo.IsDir(),
+						ModTime: fsinfo.ModTime(),
+					}
+					break
+				} else if gowebdav.IsErrCode(err, http.StatusMethodNotAllowed) {
+					err = errors.Wrapf(err, "Stat request not allowed for object at endpoint %s", endpoint.String())
+					resultsChan <- statResults{FileInfo{}, err}
+					return
+				} else if gowebdav.IsErrNotFound(err) {
+					err = errors.Wrapf(err, "object %s not found at the endpoint %s", dest.String(), endpoint.String())
+					resultsChan <- statResults{FileInfo{}, err}
 					return
 				}
 
-				if token != "" {
-					req.Header.Set("Authorization", "Bearer "+token)
-				}
-
-				resp, err = client.Do(req)
-				if err == nil {
-					break
-				}
+				// If we have a proxy error, we can try again without the proxy
 				if urle, ok := err.(*url.Error); canDisableProxy && !disableProxy && ok && urle.Unwrap() != nil {
 					if ope, ok := urle.Unwrap().(*net.OpError); ok && ope.Op == "proxyconnect" {
 						log.Warnln("Failed to connect to proxy; will retry without:", ope)
@@ -2497,37 +2761,26 @@ func statHttp(ctx context.Context, dest *url.URL, namespace namespaces.Namespace
 					}
 				}
 				log.Errorln("Failed to get HTTP response:", err)
-				resultsChan <- statResults{0, err}
+				resultsChan <- statResults{FileInfo{}, err}
 				return
 			}
 
-			defer resp.Body.Close()
-			if resp.StatusCode == 200 {
-				contentLengthStr := resp.Header.Get("Content-Length")
-				if len(contentLengthStr) == 0 {
-					log.Errorln("HEAD response did not include Content-Length header")
-					err = errors.New("HEAD response did not include Content-Length header")
-					resultsChan <- statResults{0, err}
-					return
+			if info.Size == 0 {
+				if info.IsDir {
+					resultsChan <- statResults{info, nil}
 				}
-				var contentLength int64
-				contentLength, err = strconv.ParseInt(contentLengthStr, 10, 64)
-				if err != nil {
-					log.Errorf("Unable to parse Content-Length header value (%s) as integer: %s", contentLengthStr, err)
-					resultsChan <- statResults{0, err}
-					return
-				}
-				resultsChan <- statResults{uint64(contentLength), nil}
-			} else {
-				var respB []byte
-				respB, err = io.ReadAll(resp.Body)
-				if err != nil {
-					log.Errorln("Failed to read error message:", err)
-					return
-				}
-				err = &HttpErrResp{resp.StatusCode, fmt.Sprintf("Request failed (HTTP status %d): %s", resp.StatusCode, string(respB))}
-				resultsChan <- statResults{0, err}
+				err = errors.New("Stat response did not include a size")
+				resultsChan <- statResults{FileInfo{}, err}
+				return
 			}
+
+			resultsChan <- statResults{FileInfo{
+				Name:    path.Base(endpoint.Path),
+				Size:    info.Size,
+				IsDir:   info.IsDir,
+				ModTime: info.ModTime,
+			}, nil}
+
 		}(&destCopy)
 	}
 	success := false
@@ -2535,9 +2788,8 @@ func statHttp(ctx context.Context, dest *url.URL, namespace namespaces.Namespace
 		result := <-resultsChan
 		if result.err == nil {
 			if !success {
-				cancel()
 				success = true
-				size = result.size
+				info = result.info
 			}
 		} else if err == nil && result.err != context.Canceled {
 			err = result.err

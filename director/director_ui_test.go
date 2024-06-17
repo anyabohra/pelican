@@ -26,9 +26,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/jellydator/ttlcache/v3"
-	"github.com/pelicanplatform/pelican/server_structs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/pelicanplatform/pelican/server_structs"
 )
 
 func TestListServers(t *testing.T) {
@@ -72,10 +73,9 @@ func TestListServers(t *testing.T) {
 		Type:              mockOriginServerAd.Type,
 		Latitude:          mockOriginServerAd.Latitude,
 		Longitude:         mockOriginServerAd.Longitude,
-		Writes:            mockOriginServerAd.Writes,
-		DirectReads:       mockOriginServerAd.DirectReads,
-		Listings:          mockOriginServerAd.Listings,
-		Status:            HealthStatusUnknown,
+		Caps:              mockOriginServerAd.Caps,
+		FromTopology:      mockOriginServerAd.FromTopology,
+		HealthStatus:      HealthStatusUnknown,
 		NamespacePrefixes: expectedListOriginResNss,
 	}
 
@@ -88,9 +88,9 @@ func TestListServers(t *testing.T) {
 		Type:              mockCacheServerAd.Type,
 		Latitude:          mockCacheServerAd.Latitude,
 		Longitude:         mockCacheServerAd.Longitude,
-		Writes:            mockCacheServerAd.Writes,
-		DirectReads:       mockCacheServerAd.DirectReads,
-		Status:            HealthStatusUnknown,
+		Caps:              mockCacheServerAd.Caps,
+		FromTopology:      mockCacheServerAd.FromTopology,
+		HealthStatus:      HealthStatusUnknown,
 		NamespacePrefixes: expectedListCacheResNss,
 	}
 

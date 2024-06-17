@@ -3,7 +3,7 @@ import {green, red} from "@mui/material/colors";
 import {Authenticated, secureFetch} from "@/helpers/login";
 import {Avatar, Box, IconButton, Tooltip, Typography} from "@mui/material";
 import {Block, Check, Delete, Edit, Person} from "@mui/icons-material";
-import {Alert as AlertType, Alert, Namespace} from "@/components/Main";
+import {Alert as AlertType, Alert, Namespace} from "@/index";
 import InformationDropdown from "./InformationDropdown";
 import {getServerType, NamespaceIcon} from "@/components/Namespace/index";
 import {User} from "@/index";
@@ -59,7 +59,7 @@ const approveNamespace = async (id: number) => {
             }
         }
 
-        throw new Error("Failed to approve namespace: " + alertMessage)
+        throw new Error("Failed to approve registration: " + alertMessage)
     }
 }
 
@@ -119,7 +119,7 @@ export const DeniedCard = ({
                                                 e.stopPropagation()
                                                 try {
                                                     await deleteNamespace(namespace.id)
-                                                    setAlert({severity: "success", message: "Namespace deleted"})
+                                                    setAlert({severity: "success", message: "Registration deleted"})
                                                     setTimeout(() =>  mutate("getNamespaces"), 600)
                                                 } catch (e) {
                                                     if(e instanceof Error){
@@ -139,7 +139,7 @@ export const DeniedCard = ({
                                                 e.stopPropagation()
                                                 try {
                                                     await approveNamespace(namespace.id)
-                                                    setAlert({severity: "success", message: "Namespace Approved"})
+                                                    setAlert({severity: "success", message: "Registration Approved"})
                                                     setTimeout(() =>  mutate("getNamespaces"), 600)
                                                 } catch (e) {
                                                     if(e instanceof Error){

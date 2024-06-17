@@ -24,11 +24,12 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/pkg/errors"
+
 	"github.com/pelicanplatform/pelican/config"
 	"github.com/pelicanplatform/pelican/param"
 	"github.com/pelicanplatform/pelican/server_structs"
 	"github.com/pelicanplatform/pelican/utils"
-	"github.com/pkg/errors"
 )
 
 type (
@@ -40,7 +41,7 @@ type (
 )
 
 func (server *CacheServer) CreateAdvertisement(name, originUrl, originWebUrl string) (*server_structs.OriginAdvertiseV2, error) {
-	registryPrefix := "/caches/" + param.Xrootd_Sitename.GetString()
+	registryPrefix := server_structs.GetCacheNS(param.Xrootd_Sitename.GetString())
 	ad := server_structs.OriginAdvertiseV2{
 		Name:           name,
 		RegistryPrefix: registryPrefix,
